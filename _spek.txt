@@ -1,0 +1,467 @@
+
+
+PROJECT SPEC — Sistem Antrean Rumah Sakit (Laravel)
+
+Dokumen ini adalah single source of truth untuk development. Setiap kali membuat prompt baru ke AI (Claude/lainnya) untuk fitur tertentu, paste bagian relevan dari dokumen ini sebagai konteks, supaya konsisten dengan skema, konvensi, dan style yang sudah ditetapkan.
+
+1. OVERVIEW
+
+Nama aplikasi: SIMRS Antrean (sesuaikan)
+Tujuan: Digitalisasi alur pendaftaran & pemanggilan antrean pasien rawat jalan di rumah sakit, meniadakan antrean fisik manual.
+Role: admin, dokter, pasien
+Stack:
+
+Laravel 11.x
+
+PHP 8.2+
+
+MySQL 8
+
+Blade + Alpine.js + Tailwind CSS (frontend ringan, tidak perlu SPA penuh)
+
+Livewire 3 untuk komponen real-time (panggilan antrean, papan display)
+
+Laravel Echo + Reverb (self-hosted, gratis, pengganti Pusher) untuk broadcast real-time
+
+Spatie Laravel-Permission untuk role & permission
+
+Laravel Excel (maatwebsite/excel) untuk export laporan
+
+DomPDF untuk cetak nomor antrean / laporan PDF
+
+2. KONVENSI PENAMAAN (WAJIB DIIKUTI KONSISTEN)
+
+Item
+Konvensi
+Contoh
+
+Table
+snake_case, plural
+antreans, jadwal_dokters
+
+Model
+PascalCase, singular
+Antrean, JadwalDokter
+
+Controller
+PascalCase + Controller, dikelompokkan per role dalam folder
+Admin/PoliController, Dokter/AntreanController
+
+Route name
+dot notation, prefix role
+admin.poli.index, pasien.antrean.store
+
+Blade view
+kebab-case, folder per role
+resources/views/admin/poli/index.blade.php
+
+Livewire component
+PascalCase, folder per konteks
+App\Livewire\Dokter\PanggilAntrean
+
+Service class
+PascalCase + Service
+QueueService, NotificationService
+
+Form Request
+PascalCase + Request
+StorePoliRequest, UpdateJadwalRequest
+
+Enum status
+PascalCase, backed enum string
+AntreanStatus::MENUNGGU
+
+Variabel Blade
+camelCase
+$antreanHariIni
+
+Env config custom
+UPPER_SNAKE, prefix QUEUE_
+QUEUE_RESET_HOUR=00:00
+
+Bahasa: Semua label UI, nama kolom yang tampil ke user, dan pesan error → Bahasa Indonesia. Nama variabel, class, method → Bahasa Inggris standar Laravel convention (kecuali istilah domain yang lebih jelas dalam Bahasa Indonesia seperti poli, dokter, antrean — ini tetap dipakai apa adanya sebagai istilah domain, bukan diterjemahkan jadi "queue"/"clinic").
+
+3. SKEMA DATABASE LENGKAP
+
+3.1 users (dari Breeze, ditambah kolom)
+
+id, name, email, password, phone, role_id (FK -> roles via spatie), is_active (boolean, default true), created_at, updated_at
+
+3.2 roles & model_has_roles (dihandle Spatie, tidak perlu migration manual)
+
+Seed 3 role: admin, dokter, pasien
+
+3.3 pasiens
+
+id
+user_id (FK users, unique, nullable jika pasien walk-in tanpa akun)
+no_rm (string, unique, auto-generate format RM-YYYYMM-0001)
+nik (string, unique, 16 digit)
+tanggal_lahir (date)
+jenis_kelamin (enum: L, P)
+alamat (text)
+no_telp (string)
+golongan_darah (enum: A, B, AB, O, nullable)
+created_at, updated_at
+
+3.4 polis
+
+id
+kode_poli (string, unique, contoh: POL-01)
+nama_poli (string, contoh: Poli Umum, Poli Gigi, Poli Anak)
+prefix_antrean (string, 1 huruf, contoh: A, B, C — dipakai untuk nomor antrean)
+lokasi_ruang (string, contoh: Lantai 1 Ruang 3)
+is_active (boolean, default true)
+created_at, updated_at
+
+3.5 dokters
+
+id
+user_id (FK users, unique)
+poli_id (FK polis)
+no_sip (string, unique) -- nomor surat izin praktik
+gelar_depan (string, nullable)
+gelar_belakang (string, nullable)
+is_active (boolean, default true)
+created_at, updated_at
+
+3.6 jadwal_dokters
+
+id
+dokter_id (FK dokters)
+hari (enum: senin, selasa, rabu, kamis, jumat, sabtu, minggu)
+jam_mulai (time)
+jam_selesai (time)
+kuota (integer, default 30) -- max pasien per sesi jadwal ini
+is_active (boolean, default true)
+created_at, updated_at
+
+UNIQUE constraint: (dokter_id, hari, jam_mulai) -- cegah jadwal duplikat
+
+3.7 antreans (tabel inti)
+
+id
+kode_antrean (string, unique, format: {prefix_poli}-{nomor_urut_3digit}, contoh: A-007)
+nomor_urut (integer) -- angka murni untuk sorting & logic, terpisah dari kode_antrean
+pasien_id (FK pasiens)
+dokter_id (FK dokters)
+poli_id (FK polis)
+jadwal_dokter_id (FK jadwal_dokters, nullable)
+tanggal_antrean (date) -- WAJIB, dipakai untuk reset harian
+jam_daftar (datetime)
+jam_dipanggil (datetime, nullable)
+jam_selesai (datetime, nullable)
+status (enum: menunggu, dipanggil, dilayani, selesai, batal, tidak_hadir; default menunggu)
+catatan (text, nullable) -- catatan dokter/admin
+created_at, updated_at
+
+INDEX: (poli_id, tanggal_antrean, status) -- untuk query papan antrean cepat
+UNIQUE: (pasien_id, dokter_id, tanggal_antrean) WHERE status NOT IN ('batal') -- cegah double booking
+
+Catatan teknis: constraint unique kondisional tidak native di MySQL. Implementasikan validasi double-booking di QueueService, bukan hanya mengandalkan DB constraint. Tambahkan unique index biasa di (pasien_id, dokter_id, tanggal_antrean) dan handle status 'batal' dengan soft-exclude di query level, ATAU gunakan generated column MySQL 8 sebagai workaround jika ingin enforce di DB.
+
+3.8 notifications (default Laravel notification table, dipakai apa adanya)
+
+3.9 Relasi Eloquent
+
+User        hasOne  Pasien
+User        hasOne  Dokter
+Pasien      hasMany Antrean
+Dokter      hasMany Antrean
+Dokter      hasMany JadwalDokter
+Dokter      belongsTo Poli
+Poli        hasMany Dokter
+Poli        hasMany Antrean
+Antrean     belongsTo Pasien, Dokter, Poli, JadwalDokter
+
+4. STATE MACHINE STATUS ANTREAN
+
+menunggu → dipanggil → dilayani → selesai
+menunggu → batal          (dibatalkan pasien/admin sebelum dipanggil)
+dipanggil → tidak_hadir   (dipanggil 3x tidak muncul, auto/manual oleh dokter)
+tidak_hadir → dipanggil   (dipanggil ulang manual oleh dokter, opsional)
+
+Aturan: transisi status TIDAK BOLEH lompat (misal menunggu langsung ke selesai). Validasi ini wajib ada di QueueService::updateStatus(), lempar exception kalau transisi tidak valid.
+
+5. BUSINESS LOGIC DETAIL (per Service Class)
+
+5.1 QueueService
+
+generateNomorAntrean(Poli $poli, string $tanggal): array
+
+Cari MAX(nomor_urut) untuk poli & tanggal tsb → +1. Kalau belum ada, mulai dari 1.
+
+WAJIB pakai DB transaction + lockForUpdate() pada query max nomor, untuk cegah race condition kalau 2 pasien daftar bersamaan.
+
+Return ['nomor_urut' => 7, 'kode_antrean' => 'A-007']
+
+daftarAntrean(Pasien, Dokter, Poli, tanggal): Antrean
+
+Validasi: jadwal dokter tersedia di hari tsb, kuota belum penuh, pasien belum punya antrean aktif (status IN menunggu,dipanggil,dilayani) untuk dokter yang sama di tanggal yang sama.
+
+Panggil generateNomorAntrean(), simpan record, set status menunggu.
+
+panggilBerikutnya(Dokter, tanggal): ?Antrean
+
+Ambil antrean status menunggu dengan nomor_urut terkecil untuk dokter & tanggal tsb.
+
+Update status → dipanggil, set jam_dipanggil = now().
+
+Broadcast event AntreanDipanggil.
+
+updateStatus(Antrean, string $statusBaru): void
+
+Validasi transisi sesuai state machine di atas.
+
+Jika selesai, set jam_selesai = now().
+
+resetHarian() — dijalankan via scheduled command tiap tengah malam (opsional, karena nomor_urut sudah discope per tanggal_antrean, reset ini lebih untuk cleanup/arsip, bukan wajib).
+
+5.2 NotificationService
+
+Trigger saat panggilBerikutnya() dipanggil: kirim notifikasi ke pasien dengan nomor_urut = nomor yang baru dipanggil + 2 (early warning), dan ke pasien yang baru dipanggil (pemberitahuan giliran).
+
+Channel: database (wajib), broadcast (untuk toast real-time di halaman pasien), mail/WhatsApp (opsional, fase 2).
+
+5.3 Authorization Logic (Policy, bukan cuma middleware)
+
+AntreanPolicy::call(User $user, Antrean $antrean) → true hanya jika $user->dokter->id === $antrean->dokter_id.
+
+AntreanPolicy::cancel(User $user, Antrean $antrean) → true jika admin, ATAU pasien pemilik antrean DAN status masih menunggu.
+
+Semua controller method sensitif WAJIB $this->authorize(), jangan andalkan middleware role saja (middleware cuma filter role umum, bukan ownership per-record).
+
+6. STRUKTUR ROUTE (garis besar)
+
+// routes/web.php
+Route::middleware(['auth', 'role:admin'])->prefix('admin')->name('admin.')->group(function () {
+    Route::resource('poli', PoliController::class);
+    Route::resource('dokter', DokterController::class);
+    Route::resource('jadwal', JadwalDokterController::class);
+    Route::get('laporan', [LaporanController::class, 'index'])->name('laporan.index');
+    Route::get('laporan/export', [LaporanController::class, 'export'])->name('laporan.export');
+});
+
+Route::middleware(['auth', 'role:dokter'])->prefix('dokter')->name('dokter.')->group(function () {
+    Route::get('dashboard', [DashboardController::class, 'index'])->name('dashboard');
+    Route::post('antrean/{antrean}/panggil', [AntreanController::class, 'panggil'])->name('antrean.panggil');
+    Route::post('antrean/{antrean}/selesai', [AntreanController::class, 'selesai'])->name('antrean.selesai');
+});
+
+Route::middleware(['auth', 'role:pasien'])->prefix('pasien')->name('pasien.')->group(function () {
+    Route::get('daftar-antrean', [AntreanController::class, 'create'])->name('antrean.create');
+    Route::post('daftar-antrean', [AntreanController::class, 'store'])->name('antrean.store');
+    Route::get('antrean-saya', [AntreanController::class, 'mine'])->name('antrean.mine');
+});
+
+// Publik, tanpa auth
+Route::get('/papan-antrean/{poli}', [PapanAntreanController::class, 'show'])->name('papan.show');
+
+7. STYLE GUIDE / DESIGN SYSTEM
+
+7.1 Prinsip
+
+Desain harus fungsional dan jelas dibaca dari jarak jauh (khususnya papan antrean, akan ditampilkan di TV/monitor rumah sakit). Hindari desain yang terlalu ramai/dekoratif untuk konteks medis — prioritaskan clarity, bukan estetika trendi.
+
+7.2 Palet Warna (Tailwind config custom)
+
+primary:    #0F766E  (teal-700)  -- header, tombol utama, identitas RS (kesan medis, tenang)
+primary-dark: #115E59 (teal-800)
+secondary:  #1E40AF  (blue-800)  -- aksen dokter/info
+success:    #16A34A  (green-600) -- status selesai
+warning:    #D97706  (amber-600) -- status dipanggil / menunggu lama
+danger:     #DC2626  (red-600)   -- status batal/tidak hadir
+neutral-bg: #F8FAFC  (slate-50)  -- background halaman
+neutral-text: #1E293B (slate-800)
+
+7.3 Status Badge Mapping
+
+Status
+Warna badge
+Contoh class
+
+menunggu
+slate/gray
+bg-slate-100 text-slate-700
+
+dipanggil
+amber, dengan pulse animation
+bg-amber-100 text-amber-800 animate-pulse
+
+dilayani
+blue
+bg-blue-100 text-blue-800
+
+selesai
+green
+bg-green-100 text-green-800
+
+batal
+red
+bg-red-100 text-red-700
+
+tidak_hadir
+red outline
+bg-red-50 text-red-600 border border-red-300
+
+7.4 Tipografi
+
+Font: Inter (via Google Fonts, atau font-sans default Tailwind sudah cukup)
+
+Papan antrean (display board): ukuran nomor antrean minimal text-8xl sampai text-9xl, bold, kontras tinggi — ini yang dibaca dari jarak 5-10 meter.
+
+Dashboard admin/dokter: text-sm/text-base standar, densitas informasi lebih tinggi karena dilihat dari dekat.
+
+7.5 Layout per Role
+
+Admin: sidebar layout (menu kiri fixed: Dashboard, Poli, Dokter, Jadwal, Laporan), konten kanan dengan tabel + pagination standar (gunakan komponen tabel reusable <x-table>).
+
+Dokter: layout minim distraksi, fokus 1 panel besar berisi antrean saat ini + tombol aksi besar ("Panggil Berikutnya" harus jadi tombol paling dominan di layar, ukuran besar, mudah diklik tanpa presisi tinggi — dokter sering pakai ini sambil kerja cepat).
+
+Pasien: layout mobile-first (kemungkinan besar diakses dari HP), card-based, bottom navigation jika perlu.
+
+Papan Antrean (publik): full-screen, tanpa navigasi/header standar, auto-refresh, didesain untuk TV landscape.
+
+7.6 Komponen Reusable (Blade Component)
+
+Buat di resources/views/components/:
+
+<x-status-badge :status="$antrean->status" />
+
+<x-table :headers="[...]">...</x-table>
+
+<x-button variant="primary|secondary|danger" size="sm|md|lg">
+
+<x-card>
+
+<x-empty-state message="Belum ada antrean hari ini" />
+
+7.7 Aksesibilitas & UX kecil yang penting di konteks RS
+
+Semua tombol aksi kritikal (Panggil, Selesai, Batal) harus ada konfirmasi (modal/alert) sebelum eksekusi — kesalahan klik di alur medis berdampak nyata.
+
+Kontras warna WCAG AA minimum, terutama papan antrean (dibaca lansia).
+
+Ukuran font dasar jangan di bawah text-sm (14px) di seluruh aplikasi.
+
+8. TESTING CHECKLIST (Feature Test)
+
+ Pasien tidak bisa daftar 2x antrean aktif untuk dokter sama di tanggal sama
+
+ Nomor antrean increment benar dan terpisah per poli per tanggal
+
+ Race condition: 2 request bersamaan tidak menghasilkan nomor antrean duplikat (test dengan concurrent request/lockForUpdate)
+
+ Dokter A tidak bisa panggil/ubah status antrean milik dokter B (authorization)
+
+ Transisi status ilegal (menunggu → selesai langsung) ditolak
+
+ Kuota jadwal dokter yang sudah penuh menolak pendaftaran baru
+
+ Papan antrean publik bisa diakses tanpa login
+
+ Notifikasi terkirim saat status berubah jadi dipanggil
+
+9. PANDUAN PROMPT PER FITUR (jalankan berurutan, jangan lompat)
+
+Cara pakai: sebelum tiap prompt, tempelkan juga bagian Bab 2 (konvensi), Bab 3 (skema DB), dan Bab 7 (style guide) sebagai konteks — kecuali kamu pakai tool yang bisa baca file project langsung (Claude Code, dsb), yang jauh lebih reliable daripada copy-paste manual karena tidak tergantung ingatan AI antar sesi.
+
+Gerbang wajib: jangan lanjut ke Prompt 2 sebelum migration & seeder benar-benar jalan (php artisan migrate:fresh --seed). Kalau skema goyang di awal, semua fitur di atasnya butuh rework.
+
+Prompt 1 — Fondasi Proyek & Autentikasi Multi-Role
+
+Buatkan project Laravel baru untuk sistem antrean rumah sakit.
+Setup autentikasi menggunakan Laravel Breeze dengan 3 role: admin, dokter, pasien.
+Gunakan package spatie/laravel-permission untuk role & permission management.
+Buatkan migration untuk tabel users dengan kolom tambahan sesuai Bab 3.1 di project.md.
+Buatkan middleware untuk redirect user ke dashboard sesuai role setelah login.
+Buatkan struktur folder controller terpisah per role: Admin/, Dokter/, Pasien/.
+Ikuti konvensi penamaan di Bab 2 project.md.
+
+Prompt 2 — Skema Database Inti
+
+Buatkan migration, model, dan factory untuk seluruh tabel di Bab 3 project.md
+(pasiens, polis, dokters, jadwal_dokters, antreans), lengkap dengan:
+- Relasi Eloquent sesuai Bab 3.9
+- Enum status antrean sesuai Bab 4 (state machine)
+- Index dan unique constraint sesuai catatan di tiap tabel
+Buatkan juga seeder untuk data dummy: 3 poli, 2 dokter per poli, jadwal praktik seminggu.
+Setelah selesai, jalankan migrate:fresh --seed dan pastikan tidak ada error sebelum lanjut.
+
+Prompt 3 — Modul Admin: Manajemen Master Data
+
+Buatkan CRUD untuk Admin mengelola:
+- Data Poli
+- Data Dokter (termasuk assign ke poli & set jadwal praktik di jadwal_dokters)
+- Data Pasien (view/edit, tidak perlu create manual)
+Gunakan resource controller Laravel dan Blade dengan komponen reusable dari Bab 7.6
+(x-table, x-button, x-card, x-status-badge).
+Tambahkan Form Request terpisah untuk validasi masing-masing entity, sesuai konvensi
+penamaan Bab 2 (StorePoliRequest, dst).
+Layout admin: sidebar sesuai Bab 7.5.
+
+Prompt 4 — Modul Pasien: Pendaftaran & Ambil Antrean
+
+Buatkan fitur untuk role Pasien:
+- Form pilih poli & dokter sesuai jadwal_dokters hari itu
+- Generate nomor antrean via QueueService::generateNomorAntrean() sesuai Bab 5.1
+  (WAJIB pakai DB transaction + lockForUpdate untuk cegah race condition)
+- Validasi cegah double booking sesuai aturan Bab 3.7 dan QueueService::daftarAntrean()
+- Halaman "Antrean Saya" menampilkan status sesuai badge mapping Bab 7.3
+Layout pasien: mobile-first, card-based, sesuai Bab 7.5.
+Logic generate nomor & pendaftaran WAJIB di service class QueueService, bukan di controller.
+
+Prompt 5 — Modul Dokter: Panggil & Kelola Antrean
+
+Buatkan dashboard untuk role Dokter:
+- List antrean pasien hari ini untuk dokter tsb, urut nomor_urut, status 'menunggu'
+- Tombol "Panggil Berikutnya" (besar, dominan sesuai Bab 7.5) yang memanggil
+  QueueService::panggilBerikutnya()
+- Tombol "Selesai" yang memanggil QueueService::updateStatus(), validasi transisi
+  sesuai state machine Bab 4
+- Konfirmasi modal sebelum setiap aksi kritikal, sesuai Bab 7.7
+- Riwayat pasien yang sudah dilayani hari ini
+Terapkan AntreanPolicy sesuai Bab 5.3 — dokter hanya boleh mengubah antrean miliknya sendiri.
+Gunakan Livewire untuk update status real-time tanpa reload halaman.
+
+Prompt 6 — Papan Antrean Publik (Display Board)
+
+Buatkan halaman publik (tanpa login, route sesuai Bab 6) yang menampilkan papan nomor
+antrean per poli: nomor yang sedang dipanggil, poli tujuan, ruang praktik (lokasi_ruang).
+Gunakan Laravel Echo + Reverb untuk broadcast event AntreanDipanggil (bukan polling AJAX,
+untuk mengurangi beban server jika dipasang di banyak monitor).
+Style sesuai Bab 7.4 dan 7.5: full-screen, landscape, nomor antrean text-8xl/text-9xl,
+kontras tinggi. Tambahkan animasi highlight dan suara notifikasi saat nomor baru dipanggil.
+
+Prompt 7 — Notifikasi
+
+Implementasikan NotificationService sesuai Bab 5.2:
+- Kirim notifikasi ke pasien saat antreannya akan dipanggil (2 nomor sebelum giliran)
+- Kirim notifikasi saat antreannya sedang dipanggil
+Gunakan Laravel Notification dengan channel database (wajib) dan broadcast
+(untuk toast real-time di halaman "Antrean Saya" milik pasien).
+
+Prompt 8 — Laporan & Statistik
+
+Buatkan halaman laporan untuk Admin (route: admin.laporan.index) menampilkan:
+- Jumlah pasien per poli per hari/bulan
+- Rata-rata waktu tunggu per poli (jam_dipanggil - jam_daftar)
+- Rata-rata waktu layanan per poli (jam_selesai - jam_dipanggil)
+Export ke Excel (Laravel Excel) dan PDF (DomPDF), route admin.laporan.export.
+Style tabel laporan sesuai komponen x-table di Bab 7.6.
+
+Prompt 9 — Testing
+
+Buatkan feature test sesuai checklist Bab 8 project.md, termasuk:
+- Pasien tidak bisa daftar 2x antrean aktif untuk dokter sama di tanggal sama
+- Nomor antrean generate benar dan reset per poli per tanggal
+- Test race condition: simulasikan 2 request bersamaan tidak menghasilkan nomor duplikat
+- Dokter A tidak bisa mengubah status antrean milik dokter B (test AntreanPolicy)
+- Transisi status ilegal (menunggu -> selesai langsung) dilempar exception
+
+Prompt 10 — Deployment
+
+Buatkan checklist dan konfigurasi untuk deploy ke production:
+.env production, queue worker untuk notifikasi & broadcast, supervisor config untuk
+Reverb dan queue worker, serta optimasi (config:cache, route:cache, view:cache).
+
